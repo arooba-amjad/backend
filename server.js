@@ -156,6 +156,14 @@ app.use("/api/student", (req, res, next) => {
   next();
 }, studentRoutes);
 
+// API root endpoint
+app.get("/api", (_, res) => {
+  res.json({ 
+    status: "ok", 
+    message: "API root working" 
+  });
+});
+
 // 404 handler
 app.use((req, res) => {
   res.status(404).json({ message: "Route not found" });
