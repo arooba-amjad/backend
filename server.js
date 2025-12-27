@@ -16,64 +16,65 @@ const app = express();
 const server = http.createServer(app);
 
 // CORS Configuration
-// Set CLIENT_ORIGIN environment variable with comma-separated origins
-// Example: CLIENT_ORIGIN=http://localhost:3000,https://your-site.netlify.app,https://yourdomain.com
-const allowedOrigins =
-  process.env.CLIENT_ORIGIN?.split(",").map((origin) => origin.trim()).filter(Boolean) || [];
+// Read allowed origins from FRONTEND_URL (or CLIENT_ORIGIN for backward compatibility)
+// Example: FRONTEND_URL=http://localhost:3000,https://your-site.netlify.app,https://yourdomain.com
+const frontendUrl = process.env.FRONTEND_URL || process.env.CLIENT_ORIGIN || '';
+const allowedOrigins = frontendUrl
+  ? frontendUrl.split(",").map((origin) => origin.trim()).filter(Boolean)
+  : [];
 
-// Default to localhost for development if no CLIENT_ORIGIN is set
+// Default to localhost for development if no FRONTEND_URL is set
 const corsOrigins = allowedOrigins.length
   ? allowedOrigins
   : ["http://localhost:3000", "http://localhost:3001"];
 
-// Log CORS configuration on startup (only essential info in production)
+// Log CORS configuration on startup
 const isProduction = process.env.NODE_ENV === 'production';
 if (isProduction) {
   console.log('🔒 CORS: Enabled for', corsOrigins.length, 'origin(s)');
-  // Validate CORS configuration in production
   if (corsOrigins.length === 0) {
-    console.error('❌ ERROR: CLIENT_ORIGIN must be set in production!');
-    console.error('   Set CLIENT_ORIGIN environment variable with your frontend domain(s)');
-    process.exit(1);
+    console.warn('⚠️  WARNING: FRONTEND_URL not set. Only requests without Origin header will be allowed.');
   }
   // Warn if localhost is in production CORS
   if (corsOrigins.some(origin => origin.includes('localhost'))) {
-    console.warn('⚠️  WARNING: localhost detected in CLIENT_ORIGIN for production!');
-    console.warn('   Remove localhost from CLIENT_ORIGIN in production environment');
+    console.warn('⚠️  WARNING: localhost detected in FRONTEND_URL for production!');
   }
 } else {
   console.log('🔒 CORS Configuration:');
-  console.log(`   Allowed origins: ${corsOrigins.join(', ')}`);
+  console.log(`   Allowed origins: ${corsOrigins.join(', ') || 'none (no-origin requests allowed)'}`);
   console.log(`   Credentials: enabled`);
   console.log(`   Methods: GET, POST, PUT, DELETE, PATCH, OPTIONS`);
 }
 
 const corsConfig = {
   origin: function (origin, callback) {
-    // In production, reject requests with no origin for security
-    // Only allow no-origin in development
-    const isDevelopment = process.env.NODE_ENV !== 'production';
-    
+    // Allow requests with no origin header (health checks, server-to-server, Postman, etc.)
+    // This is safe because we only validate origins when they are present
     if (!origin) {
-      if (isDevelopment) {
-        // Allow requests with no origin in development (e.g., Postman, curl)
-        return callback(null, true);
-      } else {
-        // Reject in production for security
-        console.warn('⚠️  CORS blocked request with no origin (production mode)');
-        return callback(new Error('Not allowed by CORS. Origin header required.'));
+      return callback(null, true);
+    }
+    
+    // When origin exists, only allow approved frontend origins
+    // If no origins configured, reject requests with origin (security: don't allow all)
+    if (corsOrigins.length === 0) {
+      if (!isProduction) {
+        console.warn(`⚠️  CORS: No allowed origins configured. Blocking request from origin: ${origin}`);
+        console.warn(`   Set FRONTEND_URL environment variable to allow specific origins`);
       }
+      return callback(null, false);
     }
     
     // Check if origin is in allowed list
     if (corsOrigins.indexOf(origin) !== -1) {
       callback(null, true);
     } else {
-      if (isDevelopment) {
+      // Log blocked origin in development for debugging
+      if (!isProduction) {
         console.warn(`⚠️  CORS blocked request from origin: ${origin}`);
         console.warn(`   Allowed origins: ${corsOrigins.join(', ')}`);
       }
-      callback(new Error(`Not allowed by CORS. Origin: ${origin}`));
+      // Return false instead of error to prevent server crash
+      callback(null, false);
     }
   },
   credentials: true,
@@ -122,12 +123,20 @@ const securityHeaders = (req, res, next) => {
   next();
 };
 
+// Middleware order is critical:
+// 1. Security headers first
+// 2. CORS before other middleware
+// 3. Body parsers
+// 4. Routes
+// 5. Error handlers last
+
 app.use(securityHeaders);
 app.use(cors(corsConfig));
 app.use(express.json({ limit: '100mb' }));
 app.use(express.urlencoded({ extended: true, limit: '100mb' }));
 
-// Enhanced health check endpoint
+// Health check endpoint (must be before routes, accessible without auth)
+// Render health checks don't send Origin header, so CORS allows them through
 app.get("/health", (_, res) => {
   res.json({ 
     status: "ok",
@@ -147,8 +156,32 @@ app.use("/api/student", (req, res, next) => {
   next();
 }, studentRoutes);
 
+// 404 handler
 app.use((req, res) => {
   res.status(404).json({ message: "Route not found" });
+});
+
+// Global error handler - prevents server crashes from CORS or other errors
+app.use((err, req, res, next) => {
+  // Handle CORS errors gracefully
+  if (err && (err.message?.includes('CORS') || err.message?.includes('Not allowed by CORS'))) {
+    console.warn(`⚠️  CORS error: ${err.message} from ${req.ip}`);
+    return res.status(403).json({ 
+      error: 'CORS policy violation',
+      message: 'Request not allowed by CORS policy'
+    });
+  }
+  
+  // Handle other errors
+  console.error('❌ Error:', err.message);
+  if (err.stack && !isProduction) {
+    console.error('Stack trace:', err.stack);
+  }
+  
+  res.status(err.status || 500).json({ 
+    error: 'Internal server error',
+    message: isProduction ? 'An error occurred' : err.message
+  });
 });
 
 const PORT = process.env.PORT || 5000;
