@@ -4726,9 +4726,9 @@ router.post(
   canManageAdmin,
   async (req, res) => {
     try {
-      if (!guardSupabase(res)) {
-        return;
-      }
+    if (!guardSupabase(res)) {
+      return;
+    }
 
       console.log(`[CREATE ADMIN] Request from user: ${req.user?.email} (${req.user?.role})`);
       console.log(`[CREATE ADMIN] Request body:`, JSON.stringify(req.body, null, 2));
@@ -4938,9 +4938,9 @@ router.post(
       let customRoleList = [];
       try {
         customRoleList = await syncUserCustomRoles(
-          inserted.id,
-          Array.isArray(customRoleIds) ? customRoleIds : []
-        );
+        inserted.id,
+        Array.isArray(customRoleIds) ? customRoleIds : []
+      );
       } catch (roleError) {
         console.warn("[CREATE ADMIN] Custom roles sync failed (non-critical):", roleError.message);
         // Continue without custom roles
