@@ -1,6 +1,7 @@
 import express from "express";
 import bcrypt from "bcryptjs";
 import { protect, authorizeRoles } from "../middleware/authMiddleware.js";
+import { requireWriteAccess, canManageAdmin } from "../middleware/rbacMiddleware.js";
 import { supabase } from "../config/supabaseClient.js";
 
 const router = express.Router();
@@ -9,6 +10,11 @@ const ADMIN_ROLES = ["admin", "super_admin", "co_admin"];
 const ADMIN_ROLE_ARGS = ["admin", "super_admin", "co_admin"];
 const requireAdminRole = authorizeRoles(...ADMIN_ROLE_ARGS);
 const isSuperAdmin = (user) => (user?.role || "") === "super_admin";
+// Helper: Check if user has full admin privileges (admin or super_admin)
+const hasFullAdminAccess = (user) => {
+  const role = user?.role || "";
+  return role === "admin" || role === "super_admin";
+};
 
 const guardSupabase = (res) => {
   if (!supabase) {
@@ -4716,13 +4722,21 @@ router.post(
   "/settings/admins",
   protect,
   requireAdminRole,
+  requireWriteAccess,
+  canManageAdmin,
   async (req, res) => {
-    if (!guardSupabase(res)) {
-      return;
-    }
+    try {
+      if (!guardSupabase(res)) {
+        return;
+      }
 
+      console.log(`[CREATE ADMIN] Request from user: ${req.user?.email} (${req.user?.role})`);
+      console.log(`[CREATE ADMIN] Request body:`, JSON.stringify(req.body, null, 2));
+
+    // Support both 'name' and 'fullName' for backward compatibility
     const {
       name,
+      fullName,
       email,
       password,
       role = "co_admin",
@@ -4730,62 +4744,105 @@ router.post(
       customRoleIds = [],
     } = req.body ?? {};
 
-    if (!name?.trim() || !email?.trim()) {
-      return res
-        .status(400)
-        .json({ message: "Name and email are required to create an admin." });
+    // Validation errors object
+    const validationErrors = {};
+
+    // Validate fullName/name
+    const adminName = (name || fullName)?.trim();
+    if (!adminName) {
+      validationErrors.fullName = "Full name is required";
+    } else if (adminName.length < 2) {
+      validationErrors.fullName = "Full name must be at least 2 characters";
     }
 
-    const normalizedRole = ADMIN_ROLES.includes(role)
-      ? role
-      : role === "super_admin"
-      ? "super_admin"
-      : role === "admin"
-      ? "admin"
-      : "co_admin";
+    // Validate email
+    const emailValue = email?.trim();
+    if (!emailValue) {
+      validationErrors.email = "Email is required";
+    } else {
+      const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+      if (!emailRegex.test(emailValue)) {
+        validationErrors.email = "Please enter a valid email address";
+      }
+    }
 
-    if (!isSuperAdmin(req.user) && normalizedRole !== "co_admin") {
-      return res.status(403).json({
-        message: "Only super-admins can create other admin or super-admin users.",
+    // Validate password (if provided)
+    const passwordValue = password?.trim();
+    if (passwordValue && passwordValue.length < 8) {
+      validationErrors.password = "Password must be at least 8 characters long";
+    }
+
+    // Validate role
+    const roleValue = role?.trim();
+    if (!roleValue) {
+      validationErrors.role = "Role is required";
+    } else if (!ADMIN_ROLES.includes(roleValue)) {
+      validationErrors.role = `Role must be one of: ${ADMIN_ROLES.join(", ")}`;
+    }
+
+    // Return validation errors if any
+    if (Object.keys(validationErrors).length > 0) {
+      console.log(`[CREATE ADMIN] Validation failed:`, validationErrors);
+      return res.status(400).json({
+        message: "Validation failed",
+        errors: validationErrors,
+        code: "VALIDATION_ERROR"
       });
     }
 
-    try {
-      const normalizedEmail = email.trim().toLowerCase();
+    // Normalize role
+    const normalizedRole = ADMIN_ROLES.includes(roleValue)
+      ? roleValue
+      : "co_admin";
 
+    // Both admin and super_admin can create any admin role
+    // This check is handled by canManageAdmin middleware, so no additional check needed here
+
+    const normalizedEmail = emailValue.toLowerCase();
+
+      // Check for existing email
       const { data: existing, error: existingError } = await supabase
         .from("users")
-        .select("id")
+        .select("id, email")
         .eq("email", normalizedEmail)
         .maybeSingle();
 
       if (existingError) {
+        console.error("[CREATE ADMIN] Database error checking email:", existingError);
         throw existingError;
       }
 
       if (existing) {
-        return res
-          .status(409)
-          .json({ message: "Email is already associated with an account." });
+        console.log(`[CREATE ADMIN] Email already exists: ${normalizedEmail}`);
+        return res.status(409).json({
+          message: "Email already exists",
+          errors: { email: "This email is already associated with an account" },
+          code: "EMAIL_EXISTS"
+        });
       }
 
-      let passwordToUse = password?.trim();
+      // Handle password
+      let passwordToUse = passwordValue;
       let generatedPassword = null;
 
       if (!passwordToUse) {
         generatedPassword = generateRandomPassword();
         passwordToUse = generatedPassword;
+        console.log(`[CREATE ADMIN] Generated password for: ${normalizedEmail}`);
       }
 
+      // Hash password
       const hashedPassword = await bcrypt.hash(passwordToUse, 10);
 
+      // Prepare metadata
       const metadataPayload =
         metadata && typeof metadata === "object" ? metadata : {};
 
+      // Insert admin user
       const { data: inserted, error: insertError } = await supabase
         .from("users")
         .insert({
-          name: name.trim(),
+          name: adminName,
           email: normalizedEmail,
           role: normalizedRole,
           status: "active",
@@ -4815,13 +4872,79 @@ router.post(
         .single();
 
       if (insertError) {
+        console.error("[CREATE ADMIN] Insert error:", insertError);
+        console.error("[CREATE ADMIN] Error code:", insertError.code);
+        console.error("[CREATE ADMIN] Error message:", insertError.message);
+        console.error("[CREATE ADMIN] Error details:", insertError.details);
+        console.error("[CREATE ADMIN] Error hint:", insertError.hint);
+        
+        // Handle specific database errors
+        
+        // Duplicate email error
+        if (insertError.code === "23505" || 
+            insertError.message?.includes("duplicate") || 
+            insertError.message?.includes("unique") ||
+            insertError.message?.includes("already exists")) {
+          return res.status(409).json({
+            message: "Email already exists",
+            errors: { email: "This email is already associated with an account" },
+            code: "EMAIL_EXISTS"
+          });
+        }
+        
+        // Enum value error - role not supported
+        if (insertError.code === "22P02" || 
+            insertError.message?.includes("invalid input value for enum") ||
+            insertError.message?.includes("invalid enum value") ||
+            insertError.message?.toLowerCase().includes("user_role")) {
+          return res.status(400).json({
+            message: "Invalid role value",
+            errors: { 
+              role: `The role '${normalizedRole}' is not supported. Please run FIX_USERS_TABLE_FOR_ADMIN_ROLES.sql in Supabase to add support for admin roles.` 
+            },
+            code: "INVALID_ROLE_ENUM",
+            hint: "The database role enum needs to be updated to include 'co_admin' and 'super_admin'"
+          });
+        }
+        
+        // Not null constraint violation
+        if (insertError.code === "23502" || insertError.message?.includes("null value")) {
+          const column = insertError.column || "unknown";
+          return res.status(400).json({
+            message: "Required field missing",
+            errors: { [column]: `The ${column} field is required` },
+            code: "MISSING_REQUIRED_FIELD"
+          });
+        }
+        
+        // Foreign key constraint violation
+        if (insertError.code === "23503") {
+          return res.status(400).json({
+            message: "Invalid reference",
+            errors: { general: insertError.message || "Referenced record does not exist" },
+            code: "FOREIGN_KEY_VIOLATION"
+          });
+        }
+
+        // Re-throw for other errors to be caught by outer catch
         throw insertError;
       }
 
-      const customRoleList = await syncUserCustomRoles(
-        inserted.id,
-        Array.isArray(customRoleIds) ? customRoleIds : []
-      );
+      if (!inserted) {
+        throw new Error("Failed to create admin account - no data returned");
+      }
+
+      // Sync custom roles (handle gracefully if table doesn't exist)
+      let customRoleList = [];
+      try {
+        customRoleList = await syncUserCustomRoles(
+          inserted.id,
+          Array.isArray(customRoleIds) ? customRoleIds : []
+        );
+      } catch (roleError) {
+        console.warn("[CREATE ADMIN] Custom roles sync failed (non-critical):", roleError.message);
+        // Continue without custom roles
+      }
 
       const profile = mapAdminAccount({
         ...inserted,
@@ -4829,14 +4952,35 @@ router.post(
         last_login_at: null,
       });
 
+      console.log(`[CREATE ADMIN] Successfully created admin: ${normalizedEmail} (${normalizedRole})`);
+
       res.status(201).json({
         message: "Admin account created successfully",
         profile,
         temporaryPassword: generatedPassword,
       });
     } catch (error) {
-      console.error("Create admin account error:", error);
-      res.status(500).json({ message: "Server error" });
+      console.error("[CREATE ADMIN] Unexpected error:", error);
+      console.error("[CREATE ADMIN] Error message:", error?.message);
+      console.error("[CREATE ADMIN] Error code:", error?.code);
+      console.error("[CREATE ADMIN] Error details:", error?.details);
+      console.error("[CREATE ADMIN] Error hint:", error?.hint);
+      console.error("[CREATE ADMIN] Error stack:", error?.stack);
+      
+      // Return safe error message
+      if (!res.headersSent) {
+        res.status(500).json({
+          message: "An unexpected error occurred while creating the admin account. Please try again.",
+          code: "INTERNAL_SERVER_ERROR",
+          ...(process.env.NODE_ENV === "development" && {
+            error: error?.message || String(error),
+            code: error?.code,
+            details: error?.details,
+            hint: error?.hint,
+            stack: error?.stack
+          })
+        });
+      }
     }
   }
 );
@@ -4845,6 +4989,8 @@ router.put(
   "/settings/admins/:adminId",
   protect,
   requireAdminRole,
+  requireWriteAccess,
+  canManageAdmin,
   async (req, res) => {
     if (!guardSupabase(res)) {
       return;
@@ -4884,11 +5030,8 @@ router.put(
         return res.status(404).json({ message: "Admin account not found" });
       }
 
-      if (!isSuperAdmin(req.user) && target.role === "super_admin") {
-        return res
-          .status(403)
-          .json({ message: "Only super-admins may manage this account." });
-      }
+      // Both admin and super_admin can manage all admin accounts
+      // No additional restriction needed - handled by canManageAdmin middleware
 
       const updates = {};
 
@@ -4926,11 +5069,8 @@ router.put(
       if (role) {
         const normalizedRole = ADMIN_ROLES.includes(role) ? role : target.role;
 
-        if (!isSuperAdmin(req.user) && normalizedRole !== target.role) {
-          return res.status(403).json({
-            message: "Only super-admins can change admin roles.",
-          });
-        }
+        // Both admin and super_admin can change admin roles
+        // No restriction needed - handled by canManageAdmin middleware
 
         updates.role = normalizedRole;
       }
@@ -5007,6 +5147,8 @@ router.patch(
   "/settings/admins/:adminId/status",
   protect,
   requireAdminRole,
+  requireWriteAccess,
+  canManageAdmin,
   async (req, res) => {
     if (!guardSupabase(res)) {
       return;
@@ -5042,11 +5184,8 @@ router.patch(
         return res.status(404).json({ message: "Admin account not found" });
       }
 
-      if (!isSuperAdmin(req.user) && target.role === "super_admin") {
-        return res
-          .status(403)
-          .json({ message: "Only super-admins may update this account." });
-      }
+      // Both admin and super_admin can update all admin accounts
+      // No additional restriction needed - handled by canManageAdmin middleware
 
       const { data: updated, error: updateError } = await supabase
         .from("users")
@@ -5126,14 +5265,8 @@ router.post(
         return res.status(404).json({ message: "User not found" });
       }
 
-      if (
-        ADMIN_ROLES.includes(target.role) &&
-        !isSuperAdmin(req.user)
-      ) {
-        return res.status(403).json({
-          message: "Only super-admins can reset admin passwords.",
-        });
-      }
+      // Both admin and super_admin can reset admin passwords
+      // No restriction needed - handled by requireWriteAccess middleware
 
       let passwordToUse = newPassword?.trim();
       let generatedPassword = null;
@@ -5441,16 +5574,14 @@ router.post(
   "/settings/roles",
   protect,
   requireAdminRole,
+  requireWriteAccess,
   async (req, res) => {
     if (!guardSupabase(res)) {
       return;
     }
 
-    if (!isSuperAdmin(req.user)) {
-      return res
-        .status(403)
-        .json({ message: "Only super-admins can create custom roles." });
-    }
+    // Both admin and super_admin can create custom roles
+    // Check handled by requireWriteAccess middleware
 
     const { name, description, permissions } = req.body ?? {};
 
@@ -5513,11 +5644,8 @@ router.put(
       return;
     }
 
-    if (!isSuperAdmin(req.user)) {
-      return res
-        .status(403)
-        .json({ message: "Only super-admins can update custom roles." });
-    }
+    // Both admin and super_admin can update custom roles
+    // Check handled by requireWriteAccess middleware
 
     const { roleId } = req.params;
     const { name, description, permissions } = req.body ?? {};
@@ -5596,11 +5724,8 @@ router.delete(
       return;
     }
 
-    if (!isSuperAdmin(req.user)) {
-      return res
-        .status(403)
-        .json({ message: "Only super-admins can delete custom roles." });
-    }
+    // Both admin and super_admin can delete custom roles
+    // Check handled by requireWriteAccess middleware
 
     const { roleId } = req.params;
 
@@ -5907,6 +6032,7 @@ router.post(
   "/settings/notifications/send",
   protect,
   requireAdminRole,
+  requireWriteAccess,
   async (req, res) => {
     if (!guardSupabase(res)) {
       return;
